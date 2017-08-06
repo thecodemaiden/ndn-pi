@@ -143,6 +143,40 @@ class IotController(BaseNode):
 ######
 # Certificate signing
 ######
+    def _provideRootCertificate(self, interest):
+        """
+        Sends an HMAC-signed copy of the root certificate to a newly-added
+        device, in preparation for PKI interactions
+        """
+        message = None # TODO: need protobuf format for this? maybe not
+
+        signature = HmacHelper.extractInterestSignature(interest)
+        deviceSerial = str(signature.getKeyLocator().getKeyName().get(-1).getValue())
+
+        response = Data(interest.getName())
+
+        hmac = None
+        try:
+            hmac = self._hmacDevices[deviceSerial]
+            if hmac.verifyInterest(interest):
+                certData = self._identityManager.getCertificate(self.getDefaultCertificateName())                
+                response.setContent(certData.wireEncode())
+                response.getMetaInfo().setFreshnessPeriod(10000)
+            else:
+                self.log.warn('Got invalid HMAC request from device {}'.format(deviceSerial))
+                response.setContent("Denied")
+        except KeyError:
+            self.log.warn('Got HMAC request from device with no registered key')
+        except SecurityException as e:
+            self.log.error('Could not find root certificate: '+str(e))
+            response.setContent("ERROR")
+        else:
+            self.log.info('Sending root certificate to device {}'.format(deviceSerial))
+
+        if hmac is not None:
+            hmac.signData(response)
+        self.sendData(response, False)
+
 
     def _handleCertificateRequest(self, interest):
         """
@@ -302,11 +336,14 @@ class IotController(BaseNode):
             self.log.debug("Received device list request")
             response = self._prepareCapabilitiesList(interestName)
             self.sendData(response)
-        elif afterPrefix == "certificateRequest":
+        elif afterPrefix == "generateCertificate":
             #build and sign certificate
-            self.log.debug("Received certificate request")
+            self.log.debug("Received request for new public key certificate")
             self._handleCertificateRequest(interest)
-
+        elif afterPrefix == "requestRootCertificate":
+            # send our own certificate, HMAC signed
+            self.log.debug("Received root certificate request")
+            self._provideRootCertificate(interest)
         elif afterPrefix == "updateCapabilities":
             # needs to be signed!
             self.log.debug("Received capabilities update")

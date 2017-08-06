@@ -117,7 +117,7 @@ class IotNode(BaseNode):
             self.deviceSuffix = self._extractNameFromField(environmentConfig.configuration.deviceSuffix)
 
             self._configureIdentity = Name(networkPrefix).append(self.deviceSuffix) 
-            self._sendCertificateRequest(self._configureIdentity)
+            self._requestRootCertificate()
         #else, ignore!
             
     def _onConfigurationRegistrationFailure(self, prefix):
@@ -131,11 +131,73 @@ class IotNode(BaseNode):
             self.log.critical("Could not register device prefix, ABORTING")
             self._isStopped = True
 
+####
+# Getting root credentials
+# We have to do this while still using HMAC to communicate so we know who to
+# trust...
+####
+    def _requestRootCertificate(self):
+        """
+        We compose a command interest in order to get a signed, trusted copy of
+        the controller's certificate
+        """
+        message = None # TODO: does this need a protobuf? probably not
+        interestName = Name(self._policyManager.getTrustRootIdentity()).append("requestRootCertificate")
+        interest = Interest(interestName)
+        self._hmacHandler.signInterest(interest, keyName=self.prefix)
+
+        self.log.info('Fetching root certificate')
+        self.face.expressInterest(interest, self._onRootCertificateDownload, 
+                self._onRootCertificateTimeout)
+       
+    def _onRootCertificateDownload(self, interest, data):
+        if self._hmacHandler.verifyData(data):
+            # this is the real certificate as far as we can tell
+            try:
+                # Insert root certificate so that we can verify newCert
+                rootCert = IdentityCertificate()
+                rootCert.wireDecode(data.getContent())
+
+                self._policyManager._certificateCache.insertCertificate(rootCert)
+
+                # Set the root cert as default for root identity
+                try:
+                    self._identityManager.addCertificateAsIdentityDefault(rootCert)
+                except SecurityException as e:
+                    print("Error when addCertificateAsIdentityDefault for root: " + data.getName().toUri())
+                    print(str(e))
+
+                self._rootCertificate = rootCert
+                try:
+                    # use the default configuration where possible
+                    # TODO: use environment variable for this, fall back to default
+                    fileName = os.path.expanduser('~/.ndn/.iot.root.cert')
+                    rootCertFile = open(fileName, "w")
+                    rootCertFile.write(Blob(b64encode(self._rootCertificate.wireEncode().toBytes()), False).toRawStr())
+                    rootCertFile.close()
+                except IOError as e:
+                    self.log.error("Cannot write to root certificate file: " + rootCertFile)
+                    print "Cannot write to root certificate file: " + rootCertFile
+            except SecurityException as e:
+                print(str(e))
+                # already exists, or got certificate in wrong format
+                pass
+            # ok, we know who to trust; now we can get a signed cert and make sure it's properly signed
+            self._sendCertificateRequest(self._configureIdentity)
+        else:
+            # sound the alarm, someone is messing with us...
+            self.log.error('Root certificate request intercepted!')
+
+    def _onRootCertificateTimeout(self, interest):
+        # TODO: increment counter!!!
+        self.loop.call_soon(self._requestRootCertificate)
+
+
 ###
 # Certificate signing requests
 # On startup, if we don't have a certificate signed by the controller, we request one.
 ###
-       
+
     def _sendCertificateRequest(self, keyIdentity):
         """
         We compose a command interest with our public key info so the controller
@@ -160,7 +222,7 @@ class IotNode(BaseNode):
 
         paramComponent = ProtobufTlv.encode(message)
 
-        interestName = Name(self._policyManager.getTrustRootIdentity()).append("certificateRequest").append(paramComponent)
+        interestName = Name(self._policyManager.getTrustRootIdentity()).append("generateCertificate").append(paramComponent)
         interest = Interest(interestName)
         interest.setInterestLifetimeMilliseconds(10000) # takes a tick to verify and sign
         self._hmacHandler.signInterest(interest, keyName=self.prefix)
@@ -180,97 +242,45 @@ class IotNode(BaseNode):
             self.loop.call_soon(self._sendCertificateRequest, self._configureIdentity)
         pass
 
-
-    def _processValidCertificate(self, data):
-        # unpack the cert from the HMAC signed packet and verify
-        try:
-            newCert = IdentityCertificate()
-            newCert.wireDecode(data.getContent())
-            self.log.info("Received certificate from controller")
-
-            # NOTE: we download and install the root certificate without verifying it (!)
-            # otherwise our policy manager will reject it.
-            # we may need a static method on KeyChain to allow verifying before adding
-    
-            rootCertName = newCert.getSignature().getKeyLocator().getKeyName()
-            # update trust rules so we trust the controller
-            self._policyManager.setDeviceIdentity(self._configureIdentity) 
-            self._policyManager.updateTrustRules()
-
-            def onRootCertificateDownload(interest, data):
-                try:
-                    # zhehao: the root cert is downloaded and installed without verifying; should the root cert be preconfigured?
-                    # Insert root certificate so that we can verify newCert
-                    self._policyManager._certificateCache.insertCertificate(data)
-
-                    # Set the root cert as default for root identity
-                    try:
-                        self._identityManager.addCertificateAsIdentityDefault(IdentityCertificate(data))
-                    except SecurityException as e:
-                        print("Error when addCertificateAsIdentityDefault for root: " + data.getName().toUri())
-                        print(str(e))
-
-                    self._rootCertificate = data
-                    try:
-                        # use the default configuration where possible
-                        # TODO: use environment variable for this, fall back to default
-                        fileName = os.path.expanduser('~/.ndn/.iot.root.cert')
-                        rootCertFile = open(fileName, "w")
-                        rootCertFile.write(Blob(b64encode(self._rootCertificate.wireEncode().toBytes()), False).toRawStr())
-                        rootCertFile.close()
-                    except IOError as e:
-                        self.log.error("Cannot write to root certificate file: " + rootCertFile)
-                        print "Cannot write to root certificate file: " + rootCertFile
-
-                except SecurityException as e:
-                    print(str(e))
-                    # already exists, or got certificate in wrong format
-                    pass
-                self._keyChain.verifyData(newCert, self._finalizeCertificateDownload, self._certificateValidationFailed)
-
-            def onRootCertificateTimeout(interest):
-                # TODO: limit number of tries, then revert trust root + network prefix
-                # reset salt, create new Hmac key
-                self.face.expressInterest(rootCertName, onRootCertificateDownload, onRootCertificateTimeout)
-
-            self.face.expressInterest(rootCertName, onRootCertificateDownload, onRootCertificateTimeout)
-
-        except Exception as e:
-            self.log.exception("Could not import new certificate", exc_info=True)
-   
-    def _finalizeCertificateDownload(self, newCert):
-        try:
-            self._identityManager.addCertificate(newCert)
-        except SecurityException as e:
-            print(e)
-            pass # can't tell existing certificat from another error
-        self._identityManager.setDefaultCertificateForKey(newCert)
-
-        # unregister localhop prefix, register new prefix, change identity
-        self.prefix = self._configureIdentity
-        self._policyManager.setDeviceIdentity(self.prefix)
-
-        self.face.setCommandCertificateName(self.getDefaultCertificateName())
-
-        self.face.removeRegisteredPrefix(self.tempPrefixId)
-        self.face.registerPrefix(self.prefix, self._onCommandReceived, self.onRegisterFailed)
-
-        self.loop.call_later(5, self._updateCapabilities)
-
-    def _certificateValidationFailed(self, data, reason):
-        self.log.error("Certificate from controller is invalid: " + str(reason))
-        # remove trust info
-        self._policyManager.removeTrustRules()
-
     def _onCertificateReceived(self, interest, data):
         # if we were successful, the content of this data is an HMAC
         # signed packet containing an encoded cert
+        # TODO: do we need to verify that the certificate is signed by the controller??
+        #self._keyChain.verifyData(newCert, self._finalizeCertificateDownload, self._certificateValidationFailed)
+
         if self._hmacHandler.verifyData(data):
-            self._processValidCertificate(data)
+            self.log.info("Received certificate from controller")
+            try:
+                newCert = IdentityCertificate()
+                newCert.wireDecode(data.getContent())
+            except Exception:
+                self.log.exception("Could not import device certificate", exc_info=True)
+            else:
+                try:
+                    self._identityManager.addCertificate(newCert)
+                except SecurityException as e:
+                    print(e)
+                    pass # can't tell existing certificat from another error
+                self._identityManager.setDefaultCertificateForKey(newCert)
+
+                # update trust rules so we trust the controller
+                self._policyManager.setDeviceIdentity(self._configureIdentity) 
+                self._policyManager.updateTrustRules()
+
+                # unregister localhop prefix, register new prefix, change identity
+                self.prefix = self._configureIdentity
+                self._policyManager.setDeviceIdentity(self.prefix)
+
+                self.face.setCommandCertificateName(self.getDefaultCertificateName())
+
+                self.face.removeRegisteredPrefix(self.tempPrefixId)
+                self.face.registerPrefix(self.prefix, self._onCommandReceived, self.onRegisterFailed)
+
+                self.loop.call_later(5, self._updateCapabilities)
         else:
-            self._certificateValidationFailed(data, "hmac verification failed")
-
-
+            self.log.error("Certificate from controller is invalid: " + str(reason))
+            # remove trust info
+            self._policyManager.removeTrustRules()
 
 ###
 # Device capabilities
