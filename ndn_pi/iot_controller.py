@@ -46,7 +46,7 @@ class IotController(BaseNode):
         - addDevice: add a device based on HMAC
     It is unlikely that you will need to subclass this.
     """
-    def __init__(self, nodeName, networkName, applicationDirectory = ""):
+    def __init__(self, nodeName, networkName):
         super(IotController, self).__init__()
         
         self.deviceSuffix = Name(nodeName)
@@ -74,12 +74,6 @@ class IotController(BaseNode):
 
         self._directory.update(self._baseDirectory)
 
-        # Set up application directory
-        if applicationDirectory == "":
-            applicationDirectory = os.path.expanduser('~/.ndn/iot/applications')
-        self._applicationDirectory = applicationDirectory
-        self._applications = dict()
-        
     def _insertIntoCapabilities(self, commandName, keyword, isSigned):
         newUri = Name(self.prefix).append(Name(commandName)).toUri()
         self._baseDirectory[keyword] = [{'signed':isSigned, 'name':newUri}]
@@ -103,7 +97,6 @@ class IotController(BaseNode):
           onRegisterSuccess = None, onDataNotFound = self._onCommandReceived)
         # Serve root certificate in our memoryContentCache
         self._memoryContentCache.add(self._rootCertificate)
-        self.loadApplications()
         self.loop.call_soon(self.onStartup)
 
 ######
@@ -325,37 +318,6 @@ class IotController(BaseNode):
                 self._updateDeviceCapabilities(interest)
             self._keyChain.verifyInterest(interest, 
                     onVerifiedCapabilities, self.verificationFailed)
-        elif afterPrefix == "requests":
-            # application request to publish under some names received; need to be signed
-            def onVerifiedAppRequest(interest):
-                # TODO: for now, we automatically grant access to any valid signed interest
-                print("verified! send response!")
-                message = AppRequestMessage()
-                ProtobufTlv.decode(message, interest.getName().get(prefix.size() + 1).getValue())
-                certName = Name("/".join(message.command.idName.components))
-                dataPrefix = Name("/".join(message.command.dataPrefix.components))
-                appName = message.command.appName
-                isUpdated = self.updateTrustSchema(appName, certName, dataPrefix, True)
-
-                response = Data(interest.getName())
-                if isUpdated:
-                    response.setContent("{\"status\": 200, \"message\": \"granted, trust schema updated OK\" }")
-                    self.log.info("Verified and granted application publish request")
-                else:
-                    response.setContent("{\"status\": 400, \"message\": \"not granted, requested publishing namespace already exists\" }")
-                    self.log.info("Verified and but requested namespace already exists")
-                self.sendData(response)
-                return
-            def onVerificationFailedAppRequest(interest):
-                print("application request verify failed!")
-                response = Data(interest.getName())
-                response.setContent("{\"status\": 401, \"message\": \"command interest verification failed\" }")
-                self.sendData(response)
-            self.log.info("Received application request: " + interestName.toUri())
-            #print("Verifying with trust schema: ")
-            #print(self._policyManager.config)
-            self._keyChain.verifyInterest(interest, 
-                    onVerifiedAppRequest, onVerificationFailedAppRequest)
         else:
             print("Got interest unable to answer yet: " + interest.getName().toUri())
             if interest.getExclude():
@@ -375,7 +337,6 @@ class IotController(BaseNode):
         menuStr += "P)air a new device with serial and PIN\n"
         menuStr += "D)irectory listing\n"
         menuStr += "E)xpress an interest\n"
-        menuStr += "L)oad hosted applications (" + (self._applicationDirectory) + ")\n"
         menuStr += "Q)uit\n"
 
         print(menuStr)
@@ -391,18 +352,6 @@ class IotController(BaseNode):
                 menuStr += '\t{} ({})\n'.format(info['name'], signingStr)
         print(menuStr)
         self.loop.call_soon(self.displayMenu)
-
-    def loadApplicationsMenuSelect(self):
-        try:
-            confirm = input('This will override existing trust schemas, continue? (Y/N): ').upper().startswith('Y')
-            if confirm:
-                self.loadApplications(override = True)
-            else:
-                print("Aborted")
-        except KeyboardInterrupt:
-            print("Aborted")
-        finally:
-            self.loop.call_soon(self.displayMenu)
 
     def onInterestTimeout(self, interest):
         print('Interest timed out: {}'.format(interest.getName().toUri()))
@@ -455,143 +404,9 @@ class IotController(BaseNode):
             self.expressInterest()
         elif inputStr.startswith('Q'):
             self.stop()
-        elif inputStr.startswith('L'):
-            self.loadApplicationsMenuSelect()
         else:
             self.loop.call_soon(self.displayMenu)
             
-########################
-# application trust schema distribution
-########################
-    def updateTrustSchema(self, appName, certName, dataPrefix, publishNew = False):
-        if appName in self._applications:
-            if dataPrefix.toUri() in self._applications[appName]["dataPrefix"]:
-                print("some key is configured for namespace " + dataPrefix.toUri() + " for application " + appName + ". Ignoring this request.")
-                return False
-            else:
-                # TODO: Handle malformed conf where validator tree does not exist
-                validatorNode = self._applications[appName]["tree"]["validator"][0]
-        else:
-            # This application does not previously exist, we create its trust schema 
-            # (and for now, add in static rules for sync data)
-
-            self._applications[appName] = {"tree": BoostInfoParser(), "dataPrefix": [], "version": 0}
-            validatorNode = self._applications[appName]["tree"].getRoot().createSubtree("validator")
-            
-            trustAnchorNode = validatorNode.createSubtree("trust-anchor")
-            #trustAnchorNode.createSubtree("type", "file")
-            #trustAnchorNode.createSubtree("file-name", os.path.expanduser("~/.ndn/iot/root.cert"))
-            trustAnchorNode.createSubtree("type", "base64")
-            trustAnchorNode.createSubtree("base64-string", Blob(b64encode(self._rootCertificate.wireEncode().toBytes()), False).toRawStr())
-
-            #create cert verification rule
-            # TODO: the idea for this would be, if the cert has /home-prefix/<one-component>/KEY/ksk-*/ID-CERT, then it should be signed by fixed controller(s)
-            # if the cert has /home-prefix/<multiple-components>/KEY/ksk-*/ID-CERT, then it should be checked hierarchically (this is for subdomain support)
-            certRuleNode = validatorNode.createSubtree("rule")
-            certRuleNode.createSubtree("id", "Certs")
-            certRuleNode.createSubtree("for", "data")
-
-            filterNode = certRuleNode.createSubtree("filter")
-            filterNode.createSubtree("type", "regex")
-            filterNode.createSubtree("regex", "^[^<KEY>]*<KEY><>*<ID-CERT>")
-
-            checkerNode = certRuleNode.createSubtree("checker")
-            # TODO: wait how did my first hierarchical verifier work?
-            #checkerNode.createSubtree("type", "hierarchical")
-
-            checkerNode.createSubtree("type", "customized")
-            checkerNode.createSubtree("sig-type", "rsa-sha256")
-
-            keyLocatorNode = checkerNode.createSubtree("key-locator")
-            keyLocatorNode.createSubtree("type", "name")
-            # We don't put cert version in there
-            keyLocatorNode.createSubtree("name", Name(self.getDefaultCertificateName()).getPrefix(-1).toUri())
-            keyLocatorNode.createSubtree("relation", "equal")
-
-            # Discovery rule: anything that multicasts under my home prefix should be signed, and the signer should have been authorized by root
-            # TODO: This rule as of right now is over-general
-            discoveryRuleNode = validatorNode.createSubtree("rule")
-            discoveryRuleNode.createSubtree("id", "sync-data")
-            discoveryRuleNode.createSubtree("for", "data")
-
-            filterNode = discoveryRuleNode.createSubtree("filter")
-            filterNode.createSubtree("type", "regex")
-            filterNode.createSubtree("regex", "^[^<MULTICAST>]*<MULTICAST><>*")
-
-            checkerNode = discoveryRuleNode.createSubtree("checker")
-            # TODO: wait how did my first hierarchical verifier work?
-            #checkerNode.createSubtree("type", "hierarchical")
-
-            checkerNode.createSubtree("type", "customized")
-            checkerNode.createSubtree("sig-type", "rsa-sha256")
-
-            keyLocatorNode = checkerNode.createSubtree("key-locator")
-            keyLocatorNode.createSubtree("type", "name")
-            keyLocatorNode.createSubtree("regex", "^[^<KEY>]*<KEY><>*<ID-CERT>")
-
-
-        ruleNode = validatorNode.createSubtree("rule")
-        ruleNode.createSubtree("id", dataPrefix.toUri())
-        ruleNode.createSubtree("for", "data")
-        
-        filterNode = ruleNode.createSubtree("filter")
-        filterNode.createSubtree("type", "name")
-        filterNode.createSubtree("name", dataPrefix.toUri())
-        filterNode.createSubtree("relation", "is-prefix-of")
-
-        checkerNode = ruleNode.createSubtree("checker")
-        checkerNode.createSubtree("type", "customized")
-        checkerNode.createSubtree("sig-type", "rsa-sha256")
-
-        keyLocatorNode = checkerNode.createSubtree("key-locator")
-        keyLocatorNode.createSubtree("type", "name")
-        # We don't put cert version in there
-        keyLocatorNode.createSubtree("name", certName.getPrefix(-1).toUri())
-        keyLocatorNode.createSubtree("relation", "equal")
-
-        if not os.path.exists(self._applicationDirectory):
-            os.makedirs(self._applicationDirectory)
-        self._applications[appName]["tree"].write(os.path.join(self._applicationDirectory, appName + ".conf"))
-        self._applications[appName]["dataPrefix"].append(dataPrefix.toUri())
-        self._applications[appName]["version"] = int(time.time())
-        if publishNew:
-            # TODO: ideally, this is the trust schema of the application, and does not necessarily carry controller prefix. 
-            # We make it carry controller prefix here so that prefix registration / route setup is easier (implementation workaround)
-            data = Data(Name(self.prefix).append(appName).append("_schema").appendVersion(self._applications[appName]["version"]))
-            data.setContent(str(self._applications[appName]["tree"].getRoot()))
-            self.signData(data)
-            self._memoryContentCache.add(data)
-        return True
-    
-    # TODO: putting existing confs into memoryContentCache        
-    def loadApplications(self, directory = None, override = False):
-        if not directory:
-            directory = self._applicationDirectory
-        if override:
-            self._applications.clear()
-        if os.path.exists(directory):
-            for f in os.listdir(directory):
-                fullFileName = os.path.join(directory, f)
-                if os.path.isfile(fullFileName) and f.endswith('.conf'):
-                    appName = f.rstrip('.conf')
-                    if appName in self._applications and not override:
-                        print("loadApplications: " + appName + " already exists, do nothing for configuration file: " + fullFileName)
-                    else:
-                        self._applications[appName] = {"tree": BoostInfoParser(), "dataPrefix": [], "version": int(time.time())}
-                        self._applications[appName]["tree"].read(fullFileName)
-                        data = Data(Name(self.prefix).append(appName).append("_schema").appendVersion(self._applications[appName]["version"]))
-                        data.setContent(str(self._applications[appName]["tree"].getRoot()))
-                        self.signData(data)
-                        self._memoryContentCache.add(data)
-                        try:
-                            validatorTree = self._applications[appName]["tree"]["validator"][0]
-                            for rule in validatorTree["rule"]:
-                                self._applications[appName]["dataPrefix"].append(rule["id"][0].value)
-                        # TODO: don't swallow any general exceptions, we want to catch only KeyError (make sure) here
-                        except Exception as e:
-                            print("loadApplications parse configuration file " + fullFileName + " : " + str(e))
-
-        return
 
 if __name__ == '__main__':
     import os
