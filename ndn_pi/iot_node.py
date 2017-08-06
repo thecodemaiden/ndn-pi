@@ -242,7 +242,7 @@ class IotNode(BaseNode):
         try:
             self._identityManager.addCertificate(newCert)
         except SecurityException as e:
-            #print(e)
+            print(e)
             pass # can't tell existing certificat from another error
         self._identityManager.setDefaultCertificateForKey(newCert)
 
@@ -363,12 +363,17 @@ class IotNode(BaseNode):
             return
 
         # if this is a cert request, we can serve it from our store (if it exists)
-        certData = self._identityStorage.getCertificate(interest.getName())
-        if certData is not None:
-            self.log.info("Serving certificate request")
-            # if we sign the certificate, we lose the controller's signature!
-            self.sendData(certData, False)
-            return
+        try:
+            certData = self._identityStorage.getCertificate(interest.getName())
+        except SecurityException:
+            # TODO: is it always good to ignore?
+            pass
+        else:
+            if certData is not None:
+                self.log.info("Serving certificate request")
+                # if we sign the certificate, we lose the controller's signature!
+                self.sendData(certData, False)
+                return
 
         # else we must look in our command list to see if this requires verification
         # we dispatch directly or after verification as necessary

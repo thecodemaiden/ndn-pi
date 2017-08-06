@@ -405,7 +405,7 @@ class IotController(BaseNode):
             self.loop.call_soon(self.displayMenu)
 
     def onInterestTimeout(self, interest):
-        print('Interest timed out: {}'.interest.getName().toUri())
+        print('Interest timed out: {}'.format(interest.getName().toUri()))
 
     def onDataReceived(self, interest, data):
         print('Received data named: {}'.format(data.getName().toUri()))

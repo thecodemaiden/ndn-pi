@@ -77,7 +77,7 @@ class BaseNode(object):
         logFormat = "%(asctime)-15s %(name)-20s %(funcName)-20s (%(levelname)-8s):\n\t%(message)s"
         self._console = logging.StreamHandler()
         self._console.setFormatter(logging.Formatter(logFormat))
-        self._console.setLevel(logging.INFO)
+        self._console.setLevel(logging.DEBUG)
         # without this, a lot of ThreadsafeFace errors get swallowed up
         logging.getLogger("trollius").addHandler(self._console)
         self.log.addHandler(self._console)
